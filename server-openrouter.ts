@@ -58,14 +58,53 @@ const schema = {
   fieldConfidenceMap: {}
 };
 
-async function callOpenRouter(prompt: string, fileData?: string, mimeType?: string) {
+async function callOpenRouter(prompt: string, fileData?: string, mimeType?: string, fileName = "document") {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error("OPENROUTER_API_KEY is not configured on Render");
 
   const clean = fileData?.includes("base64,") ? fileData.split("base64,")[1] : fileData;
+  const normalizedMime = String(mimeType || "").toLowerCase();
+  const isPdf = normalizedMime === "application/pdf" || /\.pdf$/i.test(fileName);
   const content: any[] = [{ type: "text", text: prompt }];
+
   if (clean) {
-    content.push({ type: "image_url", image_url: { url: `data:${mimeType || "application/pdf"};base64,${clean}` } });
+    if (isPdf) {
+      // OpenRouter PDFs must be sent as a `file` content part, not `image_url`.
+      // This also supports scanned/image-only PDFs through OpenRouter's PDF parser/OCR.
+      content.push({
+        type: "file",
+        file: {
+          filename: fileName || "policy.pdf",
+          file_data: `data:application/pdf;base64,${clean}`
+        }
+      });
+    } else if (normalizedMime.startsWith("image/")) {
+      content.push({
+        type: "image_url",
+        image_url: { url: `data:${normalizedMime};base64,${clean}` }
+      });
+    } else {
+      throw new Error("Unsupported file type. Please upload a PDF or image.");
+    }
+  }
+
+  const body: any = {
+    model: process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash",
+    temperature: 0.1,
+    max_tokens: Number(process.env.OPENROUTER_MAX_TOKENS || 6000),
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are an expert insurance policy OCR and audit assistant. Extract only information visible in the supplied document. Never invent values." },
+      { role: "user", content }
+    ]
+  };
+
+  // Use OpenRouter's OCR/parser for PDFs so image-only/scanned policy PDFs are handled too.
+  if (isPdf) {
+    body.plugins = [{
+      id: "file-parser",
+      pdf: { engine: process.env.OPENROUTER_PDF_ENGINE || "mistral-ocr" }
+    }];
   }
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -76,20 +115,11 @@ async function callOpenRouter(prompt: string, fileData?: string, mimeType?: stri
       "HTTP-Referer": process.env.APP_URL || "https://v-shiroya-policy.onrender.com",
       "X-Title": "V Shiroya Insurance Policy Analytics"
     },
-    body: JSON.stringify({
-      model: process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash",
-      temperature: 0.1,
-      max_tokens: Number(process.env.OPENROUTER_MAX_TOKENS || 6000),
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "You are an expert insurance policy OCR and audit assistant. Extract only information visible in the supplied document. Never invent values." },
-        { role: "user", content }
-      ]
-    })
+    body: JSON.stringify(body)
   });
 
   const raw = await response.text();
-  if (!response.ok) throw new Error(`OpenRouter ${response.status}: ${raw.slice(0, 500)}`);
+  if (!response.ok) throw new Error(`OpenRouter ${response.status}: ${raw.slice(0, 1000)}`);
   const data = JSON.parse(raw);
   const text = data?.choices?.[0]?.message?.content;
   const result = safeJson(text);
@@ -124,9 +154,10 @@ app.get("/api/auth/me", (_req, res) => res.json({ user: {
 app.post("/api/analyze-policy", async (req, res) => {
   const { fileData, fileName, mimeType, instruction } = req.body || {};
   if (!fileName) return res.status(400).json({ error: "Filename is required" });
+  if (!fileData) return res.status(400).json({ error: "File data is required" });
   try {
     const prompt = `Analyze this insurance document (${fileName}) thoroughly. ${instruction || "Extract all policy information."}\n\nReturn ONLY JSON using this exact structure and use null/[] when information is not visible:\n${JSON.stringify(schema)}`;
-    const result = postProcess(await callOpenRouter(prompt, fileData, mimeType));
+    const result = postProcess(await callOpenRouter(prompt, fileData, mimeType, fileName));
     audit("POLICY_ANALYSIS", `Analyzed ${fileName}`, req);
     res.json({ success: true, extraction: result });
   } catch (e: any) {
